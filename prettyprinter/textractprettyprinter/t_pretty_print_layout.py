@@ -78,13 +78,24 @@ class LinearizeLayout:
             return False
     
     def _dfs(self, root, id2block):
-        texts = []
+        texts = []  # List to collect text and table contents
+        visited_block_ids = []  # List to keep track of visited block IDs
         stack = [(root, 0)]
-
+        current_depth = 0  # Initialize with -1 to handle root depth at 0
+        
         while stack:
             block_id, depth = stack.pop()
             block = id2block[block_id]
-            
+            visited_block_ids.append(block_id)
+            # Detect depth change
+            if depth != current_depth:
+                if depth > current_depth:
+                    # Going deeper: open a new <div>
+                    texts.append('<div>' * (depth - current_depth))
+                else:
+                    # Coming back up: close the current <div>
+                    texts.append('</div>' * (current_depth - depth))
+                current_depth = depth
             if self._validate_block_skip(block["BlockType"]):
                 continue
             
@@ -142,7 +153,7 @@ class LinearizeLayout:
                     '''If Markdown is enabled then default to pipe for tables'''
                     
                     table_text = tabulate(table_data, headers=header_list, tablefmt=tab_fmt)
-                    yield table_text
+                    texts.append(table_text)
                     continue
                 else:
                     logger.warning("LAYOUT_TABLE detected but TABLES feature was not provided in API call. \
@@ -153,7 +164,7 @@ class LinearizeLayout:
                     if any(self._is_inside(block['Geometry']['BoundingBox'], figure_geom["geometry"]) \
                            for figure_geom in self.figures if figure_geom["page"] == block.get("Page",1)):
                         continue
-                yield block['Text']
+                texts.append(block["Text"])
             elif block["BlockType"] in ["LAYOUT_TITLE", "LAYOUT_SECTION_HEADER"] and "Relationships" in block:
                 # Get the associated LINE text for the layout
                 line_texts = [id2block[line_id]['Text'] for line_id in block["Relationships"][0]['Ids']]
@@ -165,14 +176,30 @@ class LinearizeLayout:
                         combined_text = f"# {combined_text}"
                     elif block["BlockType"] == "LAYOUT_SECTION_HEADER":
                         combined_text = f"## {combined_text}"
-                yield combined_text
-                
-            if block["BlockType"].startswith('LAYOUT') and block["BlockType"] not in ["LAYOUT_TITLE", "LAYOUT_SECTION_HEADER"]:
+                texts.append(combined_text)
+        # Handle LAYOUT_HEADER type with HTML <header> formatting
+            elif block["BlockType"] == "LAYOUT_HEADER" and "Relationships" in block:
+                header_texts = [id2block[line_id]['Text'] for line_id in block["Relationships"][0]['Ids']]
+                combined_header_text = ' '.join(header_texts)
+                # Wrap headers in <header>
+                combined_header_text = f"<header>{combined_header_text}</header>"
+                texts.append(combined_header_text)
+            
+            # Handle LAYOUT_FOOTER type with HTML <footer> formatting
+            elif block["BlockType"] == "LAYOUT_FOOTER" and "Relationships" in block:
+                footer_texts = [id2block[line_id]['Text'] for line_id in block["Relationships"][0]['Ids']]
+                combined_footer_text = ' '.join(footer_texts)
+                # Wrap footers in <footer>
+                combined_footer_text = f"<footer>{combined_footer_text}</footer>"
+                texts.append(combined_footer_text)
+            elif block["BlockType"].startswith('LAYOUT') and block["BlockType"] not in ["LAYOUT_TITLE", "LAYOUT_SECTION_HEADER"]:
                 if "Relationships" in block:
                     relationships = block["Relationships"]
                     children = [(x, depth + 1) for x in relationships[0]['Ids']]            
                     stack.extend(reversed(children))
-    
+        if current_depth > 0:
+            texts.append('</div>' * current_depth)
+        return texts, visited_block_ids
     def _save_to_s3(self, page_texts: dict) -> None:
         try:
             import boto3
@@ -215,13 +242,21 @@ class LinearizeLayout:
         """Retrieve the text content in specified format. Default is CSV. Options: "csv", "markdown"."""
         # texts = []
         page_texts = {}
+        all_visited_blocks = []
         layouts, id2block = self._get_layout_blocks()
+        if layouts:
+                with open("layout.json", "w") as layout_file:
+                    layout_file.write(str(layouts))
         for layout in layouts:
             root = layout['Id']
+            if (root in all_visited_blocks):
+                continue
             page_number = layout.get('Page', 1)
             if page_number not in page_texts:
                 page_texts[page_number] = ""
-            page_texts[page_number] += '\n'.join(self._dfs(root, id2block))+ "\n\n"
+            texts, visited_block_ids = self._dfs(root, id2block)
+            all_visited_blocks.extend(visited_block_ids)
+            page_texts[page_number] += '\n'.join(texts)+ "\n\n"
         if self.save_txt_path:
             self._save_to_files(page_texts)
         return page_texts
