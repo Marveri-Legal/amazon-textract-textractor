@@ -256,7 +256,7 @@ class LinearizeLayout:
                 page_texts[page_number] = ""
             texts, visited_block_ids = self._dfs(root, id2block)
             all_visited_blocks.extend(visited_block_ids)
-            page_texts[page_number] += '\n'.join(texts)+ "\n\n"
+            page_texts[page_number] += ' '.join(texts)+ "\n\n"
         if self.save_txt_path:
             self._save_to_files(page_texts)
         return page_texts
