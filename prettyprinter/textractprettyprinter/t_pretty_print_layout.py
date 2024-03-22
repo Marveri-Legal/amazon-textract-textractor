@@ -192,6 +192,13 @@ class LinearizeLayout:
                 # Wrap footers in <footer>
                 combined_footer_text = f"<footer>{combined_footer_text}</footer>"
                 texts.append(combined_footer_text)
+            # Handle LAYOUT_PAGE_NUMBER type with HTML <aside> formatting
+            elif block["BlockType"] == "LAYOUT_PAGE_NUMBER" and "Relationships" in block:
+                page_number_texts = [id2block[line_id]['Text'] for line_id in block["Relationships"][0]['Ids']]
+                combined_page_number_texts = ' '.join(page_number_texts)
+                # Wrap footers in <footer>
+                combined_page_number_texts = f"<aside>{combined_page_number_texts}</aside>"
+                texts.append(combined_page_number_texts)
             elif block["BlockType"].startswith('LAYOUT') and block["BlockType"] not in ["LAYOUT_TITLE", "LAYOUT_SECTION_HEADER"]:
                 if "Relationships" in block:
                     relationships = block["Relationships"]
