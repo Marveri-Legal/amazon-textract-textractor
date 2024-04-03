@@ -1,4 +1,7 @@
-from typing import Union, List, Optional
+from ast import Dict
+from concurrent.futures import ThreadPoolExecutor
+import random
+from typing import Any, Dict, Union, List, Optional
 from enum import Enum
 import os
 from dataclasses import dataclass, field
@@ -6,6 +9,7 @@ import boto3
 import time
 import logging
 import json
+import asyncio
 
 
 class Textract_Features(Enum):
@@ -201,9 +205,9 @@ def generate_request_params(
                 "QUERIES feature requested but not queries_config passed in."
             )
     if queries_config and queries_config.queries:
-        params['QueriesConfig'] = queries_config.get_dict()
+        params["QueriesConfig"] = queries_config.get_dict()
     if adapters_config and adapters_config.adapters:
-        params['AdaptersConfig'] = adapters_config.get_dict()
+        params["AdaptersConfig"] = adapters_config.get_dict()
     if client_request_token:
         params["ClientRequestToken"] = client_request_token
     if job_tag:
@@ -517,6 +521,97 @@ def call_textract_lending(
         )
 
 
+async def async_call_textract(
+    input_document: Union[str, bytes], config: dict, executor: ThreadPoolExecutor
+) -> dict:
+    """
+    Asynchronous wrapper around the synchronous `call_textract` function.
+    This version ensures that only the keys that match the parameters of `call_textract` are passed.
+    """
+    loop = asyncio.get_running_loop()
+
+    # Define the parameter names expected by `call_textract`
+    param_names = {
+        "features",
+        "queries_config",
+        "output_config",
+        "adapters_config",
+        "kms_key_id",
+        "job_tag",
+        "notification_channel",
+        "client_request_token",
+        "return_job_id",
+        "force_async_api",
+        "call_mode",
+        "boto3_textract_client",
+        "job_done_polling_interval",
+        "mime_type",
+    }
+
+    # Filter the `config` dict to include only keys that are valid parameters of `call_textract`
+    filtered_config = {k: v for k, v in config.items() if k in param_names}
+    func_call = lambda: call_textract(input_document, **filtered_config)
+    result = await loop.run_in_executor(executor, func_call)
+    return result
+
+async def process_document(semaphore: asyncio.Semaphore, document_id: str, document_content: Union[str, bytes], config: dict, executor: ThreadPoolExecutor) -> Dict[str, dict]:
+    """
+    Helper function to process a single document with semaphore control.
+    """
+    async with semaphore:  # Acquire a semaphore slot
+        return document_id, await async_call_textract(document_content, config, executor)
+
+async def call_textract_for_documents_in_parallel(
+    documents: Dict[str, Union[str, bytes]], config: dict
+) -> Dict[str, dict]:
+    """
+    Processes each document through Textract in parallel with a batch size of 10.
+    """
+    results = {}
+    semaphore = asyncio.Semaphore(10)  # Limit to 10 concurrent tasks
+
+    with ThreadPoolExecutor() as executor:
+        tasks = [
+            process_document(semaphore, doc_id, doc_content, config, executor)
+            for doc_id, doc_content in documents.items()
+        ]
+        for completed_task in asyncio.as_completed(tasks):
+            doc_id, result = await completed_task
+            results[doc_id] = result
+            
+    return results
+
+
+def exponential_backoff_retry(
+    call_func, max_attempts=5, initial_wait=0.5, backoff_factor=2
+):
+    """
+    Retries a function with exponential backoff.
+
+    Parameters:
+    - call_func: The function to be called, which is expected to raise an exception on failure.
+    - max_attempts: Maximum number of retry attempts.
+    - initial_wait: Initial wait time between attempts in seconds.
+    - backoff_factor: Factor by which the wait time increases after each attempt.
+    """
+    attempt = 0
+    wait_time = initial_wait
+
+    while attempt < max_attempts:
+        try:
+            return call_func()  # Try to call the function
+        except Exception as e:  # Catch exceptions that indicate a retryable failure
+            print(f"Attempt {attempt + 1} failed with error: {e}")
+            attempt += 1
+            time.sleep(wait_time)
+            wait_time *= backoff_factor + (
+                random.uniform(0, 1) * backoff_factor
+            )  # Add jitter
+
+    # After all attempts have failed, re-raise the last exception
+    raise Exception(f"All {max_attempts} attempts failed.")
+
+
 def call_textract(
     input_document: Union[str, bytes],
     features: Optional[List[Textract_Features]] = None,
@@ -532,7 +627,7 @@ def call_textract(
     call_mode: Textract_Call_Mode = Textract_Call_Mode.DEFAULT,
     boto3_textract_client=None,
     job_done_polling_interval=1,
-    mime_type: str = None, 
+    mime_type: str = None,
 ) -> dict:
     """
     calls Textract and returns a response (either full json as string (json.dumps)or the job_id when return_job_id=True)
@@ -580,7 +675,9 @@ def call_textract(
         ext: str = ""
         _, ext = os.path.splitext(input_document)
         ext = ext.lower()
-        is_pdf: bool = (ext is not None and ext.lower() in only_async_suffixes) or (mime_type == 'application/pdf')
+        is_pdf: bool = (ext is not None and ext.lower() in only_async_suffixes) or (
+            mime_type == "application/pdf"
+        )
 
         if is_pdf and not is_s3_document:
             raise ValueError("PDF only supported when located on S3")
@@ -614,11 +711,21 @@ def call_textract(
             if features:
                 logger.debug(f"calling start_document_analysis with: {features}")
                 textract_api = Textract_API.ANALYZE
-                submission_status = textract.start_document_analysis(**params)
+                submission_status = exponential_backoff_retry(
+                    lambda: textract.start_document_analysis(**params),
+                    max_attempts=5,
+                    initial_wait=1,
+                    backoff_factor=2,
+                )
             else:
                 logger.debug(f"calling start_document_text_detection")
                 textract_api = Textract_API.DETECT
-                submission_status = textract.start_document_text_detection(**params)
+                submission_status = exponential_backoff_retry(
+                    lambda: textract.start_document_text_detection(**params),
+                    max_attempts=5,
+                    initial_wait=1,
+                    backoff_factor=2,
+                )
             if submission_status["ResponseMetadata"]["HTTPStatusCode"] == 200:
                 if return_job_id:
                     return submission_status
@@ -645,9 +752,19 @@ def call_textract(
                     notification_channel=notification_channel,
                 )
                 if features:
-                    result_value = textract.analyze_document(**params)
+                    result_value = exponential_backoff_retry(
+                        lambda: textract.analyze_document(**params),
+                        max_attempts=5,
+                        initial_wait=1,
+                        backoff_factor=2,
+                    )
                 else:
-                    result_value = textract.detect_document_text(**params)
+                    result_value = exponential_backoff_retry(
+                        lambda: textract.detect_document_text(**params),
+                        max_attempts=5,
+                        initial_wait=1,
+                        backoff_factor=2,
+                    )
             # local file
             else:
                 with open(input_document, "rb") as input_file:
@@ -660,9 +777,19 @@ def call_textract(
                     )
 
                     if features:
-                        result_value = textract.analyze_document(**params)
+                        result_value = exponential_backoff_retry(
+                            lambda: textract.analyze_document(**params),
+                            max_attempts=5,
+                            initial_wait=1,
+                            backoff_factor=2,
+                        )
                     else:
-                        result_value = textract.detect_document_text(**params)
+                        result_value = exponential_backoff_retry(
+                            lambda: textract.detect_document_text(**params),
+                            max_attempts=5,
+                            initial_wait=1,
+                            backoff_factor=2,
+                        )
 
     # got bytearray, calling sync API
     elif isinstance(input_document, (bytes, bytearray)):
@@ -676,9 +803,19 @@ def call_textract(
             adapters_config=adapters_config,
         )
         if features:
-            result_value = textract.analyze_document(**params)
+            result_value = textract.exponential_backoff_retry(
+                lambda: textract.analyze_document(**params),
+                max_attempts=5,
+                initial_wait=1,
+                backoff_factor=2,
+            )
         else:
-            result_value = textract.detect_document_text(**params)
+            result_value = exponential_backoff_retry(
+                lambda: textract.detect_document_text(**params),
+                max_attempts=5,
+                initial_wait=1,
+                backoff_factor=2,
+            )
     else:
         raise ValueError(f"unsupported input_document type: {type(input_document)}")
 
